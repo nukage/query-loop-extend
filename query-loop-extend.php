@@ -44,79 +44,142 @@ function query_loop_extend_enqueue_editor_assets()
 }
 add_action('enqueue_block_editor_assets', 'query_loop_extend_enqueue_editor_assets');
 
-// Use a global to store args between the data filter and the query filter.
-// Using a simple global instead of a class for simplicity in this functional file.
-global $query_loop_extend_custom_args;
-$query_loop_extend_custom_args = null;
+// Use a global to store the RAW CODE between the data filter and the query filter.
+global $query_loop_extend_code;
+global $query_loop_extend_error;
+$query_loop_extend_code = null;
+$query_loop_extend_error = null;
 
 add_filter('render_block_data', function ($parsed_block, $source_block, $parent_block) {
-    global $query_loop_extend_custom_args;
+    global $query_loop_extend_code;
+    global $query_loop_extend_error;
 
-    // Reset for every block to prevent leaking
-    // Actually, we should only reset if we are about to process a core/query block
+    // Only target the Query Loop block
     if ($parsed_block['blockName'] === 'core/query') {
-        $query_loop_extend_custom_args = null;
+        // Reset for this block instance
+        $query_loop_extend_code = null;
+        $query_loop_extend_error = null;
 
         if (isset($parsed_block['attrs']['custom_query_php']) && !empty($parsed_block['attrs']['custom_query_php'])) {
-            $custom_php = $parsed_block['attrs']['custom_query_php'];
-            $query_args = isset($parsed_block['attrs']['query']) ? $parsed_block['attrs']['query'] : array();
-
-            $closure = function () use ($custom_php, $query_args) {
-                // Alias for user convenience
-                $query = $query_args;
-                try {
-                    $code = trim($custom_php);
-                    if (substr($code, 0, 5) === '<?php') {
-                        $code = substr($code, 5);
-                    }
-                    if (substr($code, -2) === '?>') {
-                        $code = substr($code, 0, -2);
-                    }
-                    $result = eval ($code);
-                    if (is_array($result)) {
-                        return array_merge($query_args, $result); // Return merged to capture user intent
-                    }
-                } catch (Throwable $e) {
-                }
-                return $query_args;
-            };
-
-            // Store result in global
-            $query_loop_extend_custom_args = $closure();
-
-            // Log successful calculation
-            file_put_contents(__DIR__ . '/debug_log.txt', "Global - Calculated: " . print_r($query_loop_extend_custom_args, true) . "\n", FILE_APPEND);
+            // Just store the code for now. detection of context happens later.
+            $query_loop_extend_code = $parsed_block['attrs']['custom_query_php'];
         }
     }
-
     return $parsed_block;
 }, 20, 3);
 
 /**
+ * Render block filter to show errors.
+ */
+add_filter('render_block', function ($block_content, $block) {
+    global $query_loop_extend_error;
+
+    if ('core/query' === $block['blockName'] && !empty($query_loop_extend_error)) {
+        if (current_user_can('edit_posts')) {
+            $error_message = sprintf(
+                '<div style="border: 1px solid #cc0000; background: #ffeae8; color: #cc0000; padding: 10px; margin-bottom: 10px;"><strong>Query Loop PHP Error:</strong> %s</div>',
+                esc_html($query_loop_extend_error)
+            );
+            $block_content = $error_message . $block_content;
+        }
+        // Reset error after handling
+        $query_loop_extend_error = null;
+    }
+
+    return $block_content;
+}, 10, 2);
+
+/**
  * Apply the custom args to the actual WP_Query.
+ * This runs inside the block's render_callback, where we have the correct context (page).
  */
 add_filter('query_loop_block_query_vars', function ($query_args, $block, $page) {
-    global $query_loop_extend_custom_args;
+    global $query_loop_extend_code;
+    global $query_loop_extend_error;
 
-    if (!empty($query_loop_extend_custom_args)) {
-        // Merge our global custom args into the WP Query args
-        // We assume the global strictly corresponds to the "current" block because render_block happens sequentially.
+    if (!empty($query_loop_extend_code)) {
+        $custom_php = $query_loop_extend_code;
 
-        // Verify we are indeed in a query loop block context (redundant but safe)
-        // Note: $block is the WP_Block instance.
+        // Closure to isolate scope
+        $closure = function () use ($custom_php, $query_args, $page) {
+            global $query_loop_extend_error;
 
-        $custom = $query_loop_extend_custom_args;
-        if (is_array($custom)) {
-            $query_args = array_merge($query_args, $custom);
+            // Aliases/Context for the user
+            $query = $query_args;
+            $paged = $page; // The correct page number calculated by the block
 
-            file_put_contents(__DIR__ . '/debug_log.txt', "Global - Applied Data: " . print_r($custom, true) . "\n", FILE_APPEND);
-        }
+            try {
+                $code = trim($custom_php);
+                if (substr($code, 0, 5) === '<?php') {
+                    $code = substr($code, 5);
+                }
+                if (substr($code, -2) === '?>') {
+                    $code = substr($code, 0, -2);
+                }
 
-        // Clear it after use to ensure it doesn't affect nested or subsequent blocks erroneously
-        //$query_loop_extend_custom_args = null; 
+                // Execute
+                $result = eval ($code);
+
+                if (is_array($result)) {
+                    // Compatibility Shim: Map common block attributes (camelCase) to WP_Query args (snake_case)
+                    // This helps users who might guess keys based on block attributes
+                    $map = [
+                        'postType' => 'post_type',
+                        'perPage' => 'posts_per_page',
+                        'orderBy' => 'orderby',
+                    ];
+
+                    foreach ($map as $blockKey => $queryKey) {
+                        if (isset($result[$blockKey]) && !isset($result[$queryKey])) {
+                            $result[$queryKey] = $result[$blockKey];
+                            unset($result[$blockKey]); // Clean up
+                        }
+                    }
+
+                    $final_args = array_merge($query_args, $result);
+
+                    // Logic Fix: If user modifies 'posts_per_page' but does not set an explicit 'offset',
+                    // the default offset calculated by WP (based on Block Settings) will be wrong.
+                    // Example: Block says 10, User says 2. Page 2 -> WP offset 10. We want offset 2.
+                    if (isset($result['posts_per_page']) && !isset($result['offset'])) {
+                        $per_page = (int) $final_args['posts_per_page'];
+                        // Use the strict page number passed to this filter
+                        $current_page = max(1, (int) $page);
+                        $final_args['offset'] = ($current_page - 1) * $per_page;
+
+                        // If we are adjusting found_posts (from previous step), incorporate it here?
+                        // The previous step handled explicit 'qle_offset_adjustment'. 
+                        // If the user has a custom offset logic, they usually set 'offset' explicitly.
+                        // Here we are handling the "standard" case where they just want to change page size.
+                    }
+
+                    return $final_args;
+                }
+            } catch (Throwable $e) {
+                $query_loop_extend_error = $e->getMessage();
+            }
+
+            return $query_args;
+        };
+
+        // Run it
+        $query_args = $closure();
+
+
     }
     return $query_args;
 }, 10, 3);
+
+/**
+ * Adjust found_posts when using custom offset to fix pagination.
+ */
+add_filter('found_posts', function ($found_posts, $query) {
+    if (isset($query->query_vars['qle_offset_adjustment'])) {
+        $offset = (int) $query->query_vars['qle_offset_adjustment'];
+        $found_posts = max(0, $found_posts - $offset);
+    }
+    return $found_posts;
+}, 10, 2);
 
 /**
  * Register block attributes.
