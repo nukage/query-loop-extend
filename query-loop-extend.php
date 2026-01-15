@@ -12,22 +12,6 @@ if (!defined('ABSPATH')) {
 }
 
 /**
- * Debug render_block_data.
- */
-add_filter('render_block_data', function ($parsed_block, $source_block, $parent_block) {
-    if ($parsed_block['blockName'] === 'core/query') {
-        $has_attr = isset($parsed_block['attrs']['custom_query_php']) ? 'YES' : 'NO';
-        $attr_val = $has_attr === 'YES' ? $parsed_block['attrs']['custom_query_php'] : '';
-
-        file_put_contents(
-            __DIR__ . '/debug_log.txt',
-            "render_block_data Hit for core/query.\n" .
-            "Has custom_query_php? $has_attr. Value: $attr_val\n",
-            FILE_APPEND
-        );
-    }
-    return $parsed_block;
-}, 10, 3);
 
 /**
  * Enqueue editor assets.
@@ -200,7 +184,6 @@ function query_loop_extend_register_attributes($args, $name)
             'type' => 'object',
             'default' => array(),
         );
-        file_put_contents(__DIR__ . '/debug_log.txt', "Registered attribute for core/query.\n", FILE_APPEND);
     }
     return $args;
 }
